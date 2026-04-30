@@ -1,0 +1,12 @@
+[package]
+name = "bad_project"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+bums_macros = { path = "../../bums_macros" }
+
+[build-dependencies]
+cc = "1.0"
