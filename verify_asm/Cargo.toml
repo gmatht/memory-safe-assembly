@@ -1,0 +1,10 @@
+[package]
+name = "verify_asm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bums = { path = "../memsafe-checker", features = ["x86"] }
+z3 = "0.12.1"
+log = "0.4"
+env_logger = "0.10"

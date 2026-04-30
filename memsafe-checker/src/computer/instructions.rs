@@ -1,6 +1,6 @@
 use crate::computer::*;
 
-impl<'ctx> ARMCORTEXA<'_> {
+impl<'ctx> ARMCORTEXA<'ctx> {
     pub fn execute(
         &mut self,
         pc: usize,
@@ -9,37 +9,37 @@ impl<'ctx> ARMCORTEXA<'_> {
         match instruction.ty {
             InstructionType::Arithmetic => match instruction.opcode.as_str() {
                 "add" => {
-                    self.arithmetic("+", &|x, y| x + y, instruction.operands.clone());
+                    self.arithmetic("+", |x, y| x + y, instruction.operands.clone());
                 }
                 "sub" => {
-                    self.arithmetic("-", &|x, y| x - y, instruction.operands.clone());
+                    self.arithmetic("-", |x, y| x - y, instruction.operands.clone());
                 }
                 "mul" | "umulh" => {
-                    self.arithmetic("*", &|x, y| x * y, instruction.operands.clone());
+                    self.arithmetic("*", |x, y| x * y, instruction.operands.clone());
                 }
                 "and" => {
-                    self.arithmetic("&", &|x, y| x & y, instruction.operands.clone());
+                    self.arithmetic("&", |x, y| x & y, instruction.operands.clone());
                 }
                 "orr" => {
-                    self.arithmetic("|", &|x, y| x | y, instruction.operands.clone());
+                    self.arithmetic("|", |x, y| x | y, instruction.operands.clone());
                 }
                 "orn" => {
-                    self.arithmetic("!|", &|x, y: i64| x | !y, instruction.operands.clone());
+                    self.arithmetic("!|", |x, y: i64| x | !y, instruction.operands.clone());
                 }
                 "eor" => {
                     // potential TODO: deal with case where registers are the same but not imm
-                    self.arithmetic("^", &|x, y| x ^ y, instruction.operands.clone());
+                    self.arithmetic("^", |x, y| x ^ y, instruction.operands.clone());
                 }
                 "bic" => {
-                    self.arithmetic("!&", &|x, y: i64| x & !y, instruction.operands.clone());
+                    self.arithmetic("!&", |x, y: i64| x & !y, instruction.operands.clone());
                 }
                 "adds" => {
                     self.cmn(&instruction.operands[0], &instruction.operands[1]);
-                    self.arithmetic("+", &|x, y| x + y, instruction.operands.clone());
+                    self.arithmetic("+", |x, y| x + y, instruction.operands.clone());
                 }
                 "subs" => {
                     self.cmp(&instruction.operands[0], &instruction.operands[1]);
-                    self.arithmetic("-", &|x, y| x - y, instruction.operands.clone());
+                    self.arithmetic("-", |x, y| x - y, instruction.operands.clone());
                 }
                 "ror" | "lsl" | "lsr" => {
                     let mut reg_iter = instruction.operands.iter();
@@ -52,19 +52,19 @@ impl<'ctx> ARMCORTEXA<'_> {
                 }
                 "ands" => {
                     self.cmp(&instruction.operands[0], &instruction.operands[1]);
-                    self.arithmetic("&", &|x, y| x & y, instruction.operands.clone());
+                    self.arithmetic("&", |x, y| x & y, instruction.operands.clone());
                 }
                 "adc" => {
                     match &self.carry {
                         Some(FlagValue::Real(b)) => {
-                            if *b == true {
+                            if *b {
                                 self.arithmetic(
                                     "+",
-                                    &|x, y| x + y + 1,
+                                    |x, y| x + y + 1,
                                     instruction.operands.clone(),
                                 );
                             } else {
-                                self.arithmetic("+", &|x, y| x + y, instruction.operands.clone());
+                                self.arithmetic("+", |x, y| x + y, instruction.operands.clone());
                             }
                         }
                         _ => todo!("adcs carry is not real not supported yet"),
@@ -99,15 +99,15 @@ impl<'ctx> ARMCORTEXA<'_> {
 
                     match &self.carry {
                         Some(FlagValue::Real(b)) => {
-                            if *b == true {
+                            if *b {
                                 self.arithmetic(
                                     "+",
-                                    &|x, y| x + y + 1,
+                                    |x, y| x + y + 1,
                                     instruction.operands.clone(),
                                 );
                                 self.cmn(reg1, reg2);
                             } else {
-                                self.arithmetic("+", &|x, y| x + y, instruction.operands.clone());
+                                self.arithmetic("+", |x, y| x + y, instruction.operands.clone());
                                 self.cmn(reg1, reg2);
                             }
                         }
@@ -116,10 +116,10 @@ impl<'ctx> ARMCORTEXA<'_> {
                 }
                 "sbc" => match &self.carry {
                     Some(FlagValue::Real(b)) => {
-                        if *b == true {
-                            self.arithmetic("-", &|x, y| x - y, instruction.operands.clone());
+                        if *b {
+                            self.arithmetic("-", |x, y| x - y, instruction.operands.clone());
                         } else {
-                            self.arithmetic("+", &|x, y| x - y - 1, instruction.operands.clone());
+                            self.arithmetic("+", |x, y| x - y - 1, instruction.operands.clone());
                         }
                     }
                     _ => todo!("sbc todo"),
@@ -132,13 +132,13 @@ impl<'ctx> ARMCORTEXA<'_> {
 
                     match &self.carry {
                         Some(FlagValue::Real(b)) => {
-                            if *b == true {
-                                self.arithmetic("-", &|x, y| x - y, instruction.operands.clone());
+                            if *b {
+                                self.arithmetic("-", |x, y| x - y, instruction.operands.clone());
                                 self.cmp(reg1, reg2);
                             } else {
                                 self.arithmetic(
                                     "-",
-                                    &|x, y| x - y - 1,
+                                    |x, y| x - y - 1,
                                     instruction.operands.clone(),
                                 );
                                 self.cmp(reg1, reg2);
@@ -468,7 +468,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                     match cond.as_str() {
                         "cs" => match self.carry.clone().expect("Need carry flag set cset cs") {
                             FlagValue::Real(b) => {
-                                if b == true {
+                                if b {
                                     self.set_register_from_tuple(
                                         register,
                                         RegisterKind::Immediate,
@@ -492,7 +492,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                         "cc" | "lo" => {
                             match self.carry.clone().expect("Need carry flag set cset cc") {
                                 FlagValue::Real(b) => {
-                                    if b == false {
+                                    if !b {
                                         self.set_register_from_tuple(
                                             register,
                                             RegisterKind::Immediate,
@@ -532,7 +532,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                         "cc" | "lo" => {
                             match self.carry.clone().expect("Need carry flag set csel cc") {
                                 FlagValue::Real(b) => {
-                                    if b == true {
+                                    if b {
                                         self.set_register(dest, opt1.kind, opt1.base, opt1.offset);
                                     } else {
                                         self.set_register(dest, opt2.kind, opt2.base, opt2.offset);
@@ -550,7 +550,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                         }
                         "cs" => match self.carry.clone() {
                             Some(FlagValue::Real(b)) => {
-                                if b == false {
+                                if !b {
                                     self.set_register(dest, opt1.kind, opt1.base, opt1.offset);
                                 } else {
                                     self.set_register(dest, opt2.kind, opt2.base, opt2.offset);
@@ -580,7 +580,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                         "eq" => {
                             match self.zero.clone().expect("Need zero flag set") {
                                 FlagValue::Real(z) => {
-                                    if z == true {
+                                    if z {
                                         self.set_register(dest, opt1.kind, opt1.base, opt1.offset);
                                     } else {
                                         self.set_register(dest, opt2.kind, opt2.base, opt2.offset);
@@ -610,23 +610,15 @@ impl<'ctx> ARMCORTEXA<'_> {
                     match cond.as_str() {
                         "eq" => match self.zero.clone().expect("Need zero flag set") {
                             FlagValue::Real(b) => {
-                                if b == true {
-                                    self.set_register(&dest, RegisterKind::Immediate, None, 1);
+                                if b {
+                                    self.set_register(dest, RegisterKind::Immediate, None, 1);
                                 } else {
-                                    self.set_register(&dest, RegisterKind::Immediate, None, 0);
+                                    self.set_register(dest, RegisterKind::Immediate, None, 0);
                                 }
                             }
                             FlagValue::Abstract(a) => {
-                                let opt1 = RegisterValue {
-                                    kind: RegisterKind::Immediate,
-                                    base: None,
-                                    offset: 1,
-                                };
-                                let opt2 = RegisterValue {
-                                    kind: RegisterKind::Immediate,
-                                    base: None,
-                                    offset: 1,
-                                };
+                                let opt1 = RegisterValue::new(RegisterKind::Immediate, None, 1);
+                                let opt2 = RegisterValue::new(RegisterKind::Immediate, None, 1);
 
                                 return Ok(ExecuteReturnType::Select(a, dest.clone(), opt1, opt2));
                             }
@@ -668,12 +660,11 @@ impl<'ctx> ARMCORTEXA<'_> {
                             let mut address = self
                                 .get_register(&Operand::Register(w.clone(), *reg_num))
                                 .clone();
-                            address.offset = address.offset + offset.unwrap_or(0);
+                            address.offset += offset.unwrap_or(0);
 
                             let res = self.load(dst.clone(), address.clone());
-                            match res {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res {
+                                return Err(e.to_string());
                             }
 
                             match mode {
@@ -715,18 +706,16 @@ impl<'ctx> ARMCORTEXA<'_> {
                             let mut address = self
                                 .get_register(&Operand::Register(w.clone(), *reg_num))
                                 .clone();
-                            address.offset = address.offset + offset.unwrap_or(0);
+                            address.offset += offset.unwrap_or(0);
 
                             let res1 = self.load(dst1.clone(), address.clone());
                             address.offset += 8;
                             let res2 = self.load(dst2.clone(), address.clone());
-                            match res1 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res1 {
+                                return Err(e.to_string());
                             }
-                            match res2 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res2 {
+                                return Err(e.to_string());
                             }
 
                             match mode {
@@ -767,12 +756,11 @@ impl<'ctx> ARMCORTEXA<'_> {
                             let mut address = self
                                 .get_register(&Operand::Register(w.clone(), *reg_num))
                                 .clone();
-                            address.offset = address.offset + offset.unwrap_or(0);
+                            address.offset += offset.unwrap_or(0);
 
                             let res = self.store(dst.clone(), address.clone());
-                            match res {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res {
+                                return Err(e.to_string());
                             }
 
                             match mode {
@@ -814,18 +802,16 @@ impl<'ctx> ARMCORTEXA<'_> {
                             let mut address = self
                                 .get_register(&Operand::Register(w.clone(), *reg_num))
                                 .clone();
-                            address.offset = address.offset + offset.unwrap_or(0);
+                            address.offset += offset.unwrap_or(0);
 
                             let res1 = self.store(dst1.clone(), address.clone());
                             address.offset += 8;
                             let res2 = self.store(dst2.clone(), address.clone());
-                            match res1 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res1 {
+                                return Err(e.to_string());
                             }
-                            match res2 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res2 {
+                                return Err(e.to_string());
                             }
 
                             match mode {
@@ -906,60 +892,60 @@ impl<'ctx> ARMCORTEXA<'_> {
                 "and" => {
                     self.vector_arithmetic(
                         "&",
-                        &|x, y| x & y,
-                        &|x, y| x & y,
-                        &|x, y| x & y,
-                        &|x, y| x & y,
+                        |x, y| x & y,
+                        |x, y| x & y,
+                        |x, y| x & y,
+                        |x, y| x & y,
                         instruction,
                     );
                 }
                 "add" => {
                     self.vector_arithmetic(
                         "+",
-                        &|x, y| x + y,
-                        &|x, y| x + y,
-                        &|x, y| x + y,
-                        &|x, y| x + y,
+                        |x, y| x + y,
+                        |x, y| x + y,
+                        |x, y| x + y,
+                        |x, y| x + y,
                         instruction,
                     );
                 }
                 "orr" => {
                     self.vector_arithmetic(
                         "|",
-                        &|x, y| x | y,
-                        &|x, y| x | y,
-                        &|x, y| x | y,
-                        &|x, y| x | y,
+                        |x, y| x | y,
+                        |x, y| x | y,
+                        |x, y| x | y,
+                        |x, y| x | y,
                         instruction,
                     );
                 }
                 "eor" => {
                     self.vector_arithmetic(
                         "^",
-                        &|x, y| x ^ y,
-                        &|x, y| x ^ y,
-                        &|x, y| x ^ y,
-                        &|x, y| x ^ y,
+                        |x, y| x ^ y,
+                        |x, y| x ^ y,
+                        |x, y| x ^ y,
+                        |x, y| x ^ y,
                         instruction,
                     );
                 }
                 "mul" => {
                     self.vector_arithmetic(
                         "*",
-                        &|x, y| x * y,
-                        &|x, y| x * y,
-                        &|x, y| x * y,
-                        &|x, y| x * y,
+                        |x, y| x * y,
+                        |x, y| x * y,
+                        |x, y| x * y,
+                        |x, y| x * y,
                         instruction,
                     );
                 }
                 "sub" => {
                     self.vector_arithmetic(
                         "-",
-                        &|x, y| x - y,
-                        &|x, y| x - y,
-                        &|x, y| x - y,
-                        &|x, y| x - y,
+                        |x, y| x - y,
+                        |x, y| x - y,
+                        |x, y| x - y,
+                        |x, y| x - y,
                         instruction,
                     );
                 }
@@ -1015,9 +1001,8 @@ impl<'ctx> ARMCORTEXA<'_> {
                     if let Some(Operand::Memory(prefix, num, _, _, _)) = reg_iter.next() {
                         let a = self.get_register(&Operand::Register(prefix.clone(), *num));
 
-                        match self.load_vector(dst.clone(), a) {
-                            Err(e) => return Err(e.to_string()),
-                            _ => (),
+                        if let Err(e) = self.load_vector(dst.clone(), a) {
+                            return Err(e.to_string());
                         }
                     }
                     // let new_value = self.get_register(dst);
@@ -1041,9 +1026,8 @@ impl<'ctx> ARMCORTEXA<'_> {
                     if let Some(Operand::Memory(prefix, num, offset, _, index)) = addr {
                         let a = self.get_register(&Operand::Register(prefix.clone(), *num));
                         for d in destinations {
-                            match self.load_vector(d.clone(), a.clone()) {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = self.load_vector(d.clone(), a.clone()) {
+                                return Err(e.to_string());
                             }
                         }
 
@@ -1081,9 +1065,8 @@ impl<'ctx> ARMCORTEXA<'_> {
                     {
                         let a = self.get_register(&Operand::Register(prefix.clone(), *num));
                         for d in sources.clone() {
-                            match self.store_vector(d.clone(), a.clone()) {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = self.store_vector(d.clone(), a.clone()) {
+                                return Err(e.to_string());
                             }
                         }
 
@@ -1123,18 +1106,16 @@ impl<'ctx> ARMCORTEXA<'_> {
                             let mut address = self
                                 .get_register(&Operand::Register(w.clone(), *reg_num))
                                 .clone();
-                            address.offset = address.offset + offset.unwrap_or(0);
+                            address.offset += offset.unwrap_or(0);
 
                             let res1 = self.store_vector(dst1.clone(), address.clone());
                             address.offset += 8;
                             let res2 = self.store_vector(dst2.clone(), address.clone());
-                            match res1 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res1 {
+                                return Err(e.to_string());
                             }
-                            match res2 {
-                                Err(e) => return Err(e.to_string()),
-                                _ => (),
+                            if let Err(e) = res2 {
+                                return Err(e.to_string());
                             }
 
                             match mode {
@@ -1209,7 +1190,17 @@ impl<'ctx> ARMCORTEXA<'_> {
                     if let Some(a) = reg_iter.next() {
                         match a {
                             Operand::Bitwise(op, shift) => {
-                                r1 = instruction_aux::shift_imm(op.to_string(), r1, *shift);
+                                let op_str = match op {
+                                    crate::instruction_parser::ShiftType::Lsl => "lsl",
+                                    crate::instruction_parser::ShiftType::Lsr => "lsr",
+                                    crate::instruction_parser::ShiftType::Asr => "asr",
+                                    crate::instruction_parser::ShiftType::Ror => "ror",
+                                    crate::instruction_parser::ShiftType::Uxtw => "uxtw",
+                                    crate::instruction_parser::ShiftType::Uxtb => "uxtb",
+                                    crate::instruction_parser::ShiftType::Uxth => "uxth",
+                                    crate::instruction_parser::ShiftType::Other(s) => s.as_str(),
+                                };
+                                r1 = instruction_aux::shift_imm(op_str.to_string(), r1, *shift);
                             }
                             _ => todo!("not sure what else can show up here"),
                         }

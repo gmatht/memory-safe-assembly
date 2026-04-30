@@ -1,0 +1,11 @@
+error: unknown key 'bogus'
+ --> tests/compile-fail/bad_asm.rs:5:32
+  |
+5 | #[memsafe_multiversion(bogus = 1)]
+  |                                ^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/compile-fail/bad_asm.rs:6:24
+  |
+6 | pub fn should_fail() {}
+  |                        ^ consider adding a `main` function to `$DIR/tests/compile-fail/bad_asm.rs`

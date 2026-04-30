@@ -11,6 +11,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use syn::*;
 use z3::{Config, Context};
+use z3::ast::Ast;
 
 use bums::common::*;
 
@@ -900,4 +901,812 @@ pub fn check_mem_safe(attr: TokenStream, item: TokenStream) -> TokenStream {
             return token_stream;
         }
     };
+}
+
+// New attribute for x86 conservative checker
+#[proc_macro_attribute]
+#[proc_macro_error]
+pub fn check_mem_safe_x86(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // For MVP reuse most of the logic from check_mem_safe but only do the minimal engine invocation
+    let vars = parse_macro_input!(item as CallColon);
+    let mut attributes = parse_macro_input!(attr as AttributeList);
+    let _fn_name = &vars.item_fn.ident;
+    let output = &vars.item_fn.output;
+
+    // minimal: collect asserts if provided
+    let mut asserts = quote! {};
+    if let Some(Expr::Array(a)) = attributes.argument_list.last() {
+        for e in &a.elems {
+            asserts = quote! { #asserts assert!(#e); };
+        }
+        attributes.argument_list.pop();
+    }
+
+    // Build extern fn and unsafe invocation like above
+    let original_fn_call = vars.item_fn.clone();
+    let unsafe_block: Stmt = parse_quote! {
+        #original_fn_call {
+            #asserts;
+            extern "C" {
+                #original_fn_call #output;
+            }
+            unsafe { return #original_fn_call; }
+        }
+    };
+
+    let token_stream = quote!(#unsafe_block).into();
+
+    // open assembly file
+    let filename = attributes.filename.value();
+    let assembly_file: std::path::PathBuf =
+        [std::env::var("OUT_DIR").expect("OUT_DIR"), filename.clone()]
+            .iter()
+            .collect();
+    let res = File::open(assembly_file);
+    let file: File;
+    match res {
+        Ok(opened) => file = opened,
+        Err(error) => abort_call_site!(error),
+    }
+
+    let reader = BufReader::new(file);
+    let mut program = Vec::new();
+    for line in reader.lines() {
+        program.push(line.unwrap_or(String::from("")));
+    }
+
+    // create z3 context and call x86 engine
+    let cfg = Config::new();
+    let ctx = Context::new(&cfg);
+    // write program into a temporary file in OUT_DIR and invoke ExecutionEngineX86::from_asm_file
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let temp_path = std::path::Path::new(&out_dir).join(filename.clone());
+    // file already exists in OUT_DIR in normal usage
+
+    // call engine
+    let mut engine =
+        bums::x86_64::ExecutionEngineX86::from_asm_file(temp_path.to_str().unwrap(), &ctx);
+
+    // Minimal: add memory regions and set initial register abstracts for function arguments.
+    // Map first six integer/pointer args to registers (SysV-like): rdi, rsi, rdx, rcx, r8, r9
+    let arg_regs = vec!["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    let mut arg_index = 0usize;
+    for input in &vars.item_fn.inputs {
+        if let FnArg::Typed(pat_type) = input {
+            // get name
+            let name = match &*pat_type.pat {
+                Pat::Ident(id) => id.ident.to_string(),
+                _ => continue,
+            };
+
+            // determine size in bytes conservatively
+            let mut size_bytes: Option<i64> = None;
+            match &*pat_type.ty {
+                Type::Array(a) => {
+                    let s = calculate_size_of_array(a) as i64;
+                    size_bytes = Some(s);
+                }
+                Type::Reference(a) => match &*a.elem {
+                    Type::Array(b) => {
+                        let s = calculate_size_of_array(b) as i64;
+                        size_bytes = Some(s);
+                    }
+                    Type::Path(p) => {
+                        let ty = p.path.segments[0].ident.to_string();
+                        let s = calculate_size_of(ty) as i64;
+                        size_bytes = Some(s);
+                    }
+                    _ => {}
+                },
+                Type::Path(p) => {
+                    let ty = p.path.segments[0].ident.to_string();
+                    let s = calculate_size_of(ty) as i64;
+                    size_bytes = Some(s * 2);
+                }
+                _ => {}
+            }
+
+            // default if unknown
+            let length = AbstractExpression::Immediate(size_bytes.unwrap_or(4096));
+
+            // insert memory region and add an abstract region mapping
+            engine
+                .computer
+                .add_memory_region(name.clone(), RegionType::RW, length.clone());
+
+            // set register abstract for this argument if we have a register mapping
+            if arg_index < arg_regs.len() {
+                let reg = arg_regs[arg_index];
+                engine.computer.set_register_abstract(
+                    reg,
+                    Some(AbstractExpression::Abstract(name)),
+                    0,
+                );
+            }
+            arg_index += 1;
+        }
+    }
+
+    let label = vars.item_fn.ident.to_string();
+    let res = engine.start(&label);
+    match res {
+        Ok(_) => return token_stream,
+        Err(err) => {
+            #[cfg(not(debug_assertions))]
+            emit_call_site_error!(err);
+            #[cfg(debug_assertions)]
+            emit_call_site_warning!(err);
+            return token_stream;
+        }
+    }
+}
+
+// Minimal key=value parser for the memsafe_multiversion attribute.
+struct VersionSpec {
+    pub file: syn::LitStr,
+    pub symbol: Option<syn::LitStr>,
+    pub features: Vec<syn::LitStr>,
+}
+
+struct MultiAttr {
+    pub versions: Vec<VersionSpec>,
+    pub entry: Option<syn::LitStr>,
+    pub fallback: Option<syn::Ident>,
+    pub invariants: Vec<syn::Expr>,
+    pub abi_probe: bool,
+    pub abi_probe_sample_size: Option<usize>,
+}
+
+impl Parse for MultiAttr {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut versions: Vec<VersionSpec> = Vec::new();
+        let mut entry: Option<syn::LitStr> = None;
+        let mut fallback: Option<syn::Ident> = None;
+        let mut invariants: Vec<syn::Expr> = Vec::new();
+        let mut abi_probe = false;
+        let mut abi_probe_sample_size: Option<usize> = None;
+
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let k = key.to_string();
+            if k == "versions" {
+                // parse versions as an array of tuples: [("file.s", "symbol", ["feat1"]), ...]
+                let arr: syn::ExprArray = input.parse()?;
+                for elem in arr.elems.iter() {
+                    if let syn::Expr::Tuple(t) = elem {
+                        if t.elems.len() < 1 {
+                            return Err(input.error("version tuple must contain at least file string"));
+                        }
+                        // file
+                        let file = match &t.elems[0] {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.clone(),
+                            _ => return Err(input.error("version file must be a string literal")),
+                        };
+                        // symbol (optional)
+                        let symbol = if t.elems.len() > 1 {
+                            match &t.elems[1] {
+                                syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some(s.clone()),
+                                syn::Expr::Lit(_) => return Err(input.error("symbol must be a string literal")),
+                                _ => None,
+                            }
+                        } else { None };
+                        // features (optional)
+                        let mut features: Vec<syn::LitStr> = Vec::new();
+                        if t.elems.len() > 2 {
+                            if let syn::Expr::Array(arr2) = &t.elems[2] {
+                                for fe in &arr2.elems {
+                                    if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = fe {
+                                        features.push(s.clone());
+                                    } else {
+                                        return Err(input.error("features array must contain string literals"));
+                                    }
+                                }
+                            } else {
+                                return Err(input.error("features must be an array of string literals"));
+                            }
+                        }
+                        versions.push(VersionSpec { file, symbol, features });
+                    } else {
+                        return Err(input.error("each version entry must be a tuple: (\"file\", \"symbol\", [\"feat\"])"));
+                    }
+                }
+            } else if k == "entry" {
+                entry = Some(input.parse::<syn::LitStr>()?);
+            } else if k == "fallback" {
+                // accept an identifier for fallback
+                if input.peek(syn::Ident) {
+                    fallback = Some(input.parse::<syn::Ident>()?);
+                } else if input.peek(LitStr) {
+                    let s = input.parse::<LitStr>()?;
+                    fallback = Some(Ident::new(&s.value(), proc_macro2::Span::call_site()));
+                } else {
+                    return Err(input.error("fallback must be an identifier or string"));
+                }
+            } else if k == "invariants" {
+                // parse an array of expressions
+                let arr: syn::ExprArray = input.parse()?;
+                for e in arr.elems.iter() {
+                    invariants.push(e.clone());
+                }
+            } else if k == "abi_probe" {
+                // expect boolean literal
+                let ex: syn::Expr = input.parse()?;
+                if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) = ex {
+                    abi_probe = b.value;
+                } else {
+                    return Err(input.error("abi_probe must be a boolean literal"));
+                }
+            } else if k == "abi_probe_sample_size" {
+                let lit: syn::LitInt = input.parse()?;
+                let v = lit.base10_parse::<usize>()?;
+                abi_probe_sample_size = Some(v);
+            } else {
+                return Err(input.error(format!("unknown key '{}'", k)));
+            }
+
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(MultiAttr {
+            versions,
+            entry,
+            fallback,
+            invariants,
+            abi_probe,
+            abi_probe_sample_size,
+        })
+    }
+}
+
+#[proc_macro_attribute]
+#[proc_macro_error]
+pub fn memsafe_multiversion(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Parse attribute and function item
+    let attr = parse_macro_input!(attr as MultiAttr);
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    // extract function info
+    let vis = &input_fn.vis;
+    let sig = &input_fn.sig;
+    let fn_ident = sig.ident.clone();
+    let fn_name_string = fn_ident.to_string();
+
+    // decide entry label inside asm
+    let entry_label = if let Some(e) = &attr.entry { e.value() } else { fn_name_string.clone() };
+
+    // For each version, run memsafe-checker to prove its assembly safe under the harness
+    let cfg = Config::new();
+    let ctx = Context::new(&cfg);
+
+    struct VariantInfo {
+        symbol_str: String,
+        rust_ident: syn::Ident,
+        features: Vec<String>,
+        filename: String,
+    }
+    let mut variants: Vec<VariantInfo> = Vec::new();
+
+    for (vi, vspec) in attr.versions.iter().enumerate() {
+        let filename = vspec.file.value();
+        let assembly_file: std::path::PathBuf = [std::env::var("OUT_DIR").expect("OUT_DIR"), filename.clone()].iter().collect();
+        let f = File::open(&assembly_file).unwrap_or_else(|e| abort_call_site!(e));
+        let reader = BufReader::new(f);
+        let mut program: Vec<String> = Vec::new();
+        for line in reader.lines() { program.push(line.unwrap_or(String::from(""))); }
+
+        let mut engine = bums::x86_64::ExecutionEngineX86::from_asm_file(assembly_file.to_str().unwrap(), &ctx);
+
+        // Map function inputs to memory regions & register abstracts
+        let arg_regs = vec!["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        let mut arg_index = 0usize;
+        for input in &sig.inputs {
+            if let FnArg::Typed(pat_type) = input {
+                let name = match &*pat_type.pat { Pat::Ident(id) => id.ident.to_string(), _ => continue };
+                let mut size_bytes: Option<i64> = None;
+                match &*pat_type.ty {
+                    Type::Array(a) => { let s = calculate_size_of_array(a) as i64; size_bytes = Some(s); }
+                    Type::Reference(a) => match &*a.elem {
+                        Type::Array(b) => { let s = calculate_size_of_array(b) as i64; size_bytes = Some(s); }
+                        Type::Path(p) => { let ty = p.path.segments[0].ident.to_string(); let s = calculate_size_of(ty) as i64; size_bytes = Some(s); }
+                        _ => {}
+                    },
+                    Type::Path(p) => { let ty = p.path.segments[0].ident.to_string(); let s = calculate_size_of(ty) as i64; size_bytes = Some(s * 2); }
+                    _ => {}
+                }
+                let length = AbstractExpression::Immediate(size_bytes.unwrap_or(4096));
+                engine.computer.add_memory_region(name.clone(), RegionType::RW, length.clone());
+                if arg_index < arg_regs.len() {
+                    let reg = arg_regs[arg_index];
+                    engine.computer.set_register_abstract(reg, Some(AbstractExpression::Abstract(name)), 0);
+                }
+                arg_index += 1;
+            }
+        }
+
+        // apply invariants
+        for inv in &attr.invariants {
+            if let syn::Expr::Binary(b) = inv {
+                let ac = binary_to_abstract_comparison(b);
+                let c = comparison_to_ast(engine.computer.context, ac).expect("engine6.5").simplify();
+                engine.computer.solver.assert(&c);
+            } else {
+                abort_call_site!("invariants must be binary expressions");
+            }
+        }
+
+        // run engine from entry label
+        let res = engine.start(&entry_label);
+        if let Err(err) = res {
+            // Build enhanced diagnostic information to help the user
+            let mut diag = String::new();
+            diag.push_str(&format!("variant {} proof failure:\n{}\n", filename, err));
+
+            // include a short assembly listing (with line numbers) to provide context
+            diag.push_str("-- asm (first 200 lines) --\n");
+            for (i, l) in program.iter().enumerate().take(200) {
+                diag.push_str(&format!("{:5}: {}\n", i + 1, l));
+            }
+
+            // include any memory labels and relocations recorded by the engine
+            if let Ok(rels) = std::panic::catch_unwind(|| engine.list_relocations()) {
+                let rels: Vec<String> = rels;
+                if !rels.is_empty() {
+                    diag.push_str("-- relocations --\n");
+                    for r in rels.iter() {
+                        diag.push_str(&format!("{}\n", r));
+                    }
+                }
+            }
+            if let Ok(labels) = std::panic::catch_unwind(|| engine.dump_memory_labels()) {
+                let labels: Vec<String> = labels;
+                if !labels.is_empty() {
+                    diag.push_str("-- memory labels --\n");
+                    for l in labels.iter() {
+                        diag.push_str(&format!("{}\n", l));
+                    }
+                }
+            }
+
+            #[cfg(not(debug_assertions))]
+            emit_call_site_error!(diag);
+            #[cfg(debug_assertions)]
+            emit_call_site_warning!(diag);
+            return TokenStream::new();
+        }
+
+        // prepare variant info
+        let symbol_str = if let Some(s) = &vspec.symbol { s.value() } else { format!("{}_v{}", fn_name_string, vi) };
+        // create a unique Rust identifier for the extern declaration and use link_name to bind
+        // Include the wrapper function name and variant index to avoid collisions across the crate.
+        let rust_name = format!("__asm_{}_v{}", fn_name_string, vi);
+        let rust_ident = Ident::new(&rust_name, proc_macro2::Span::call_site());
+        let features: Vec<String> = vspec.features.iter().map(|s| s.value()).collect();
+        variants.push(VariantInfo { symbol_str, rust_ident, features, filename });
+    }
+
+    // fallback must be provided (for this MVP we require a Rust fallback)
+    let fallback_ident = if let Some(id) = attr.fallback.clone() {
+        id
+    } else {
+        abort_call_site!("memsafe_multiversion: missing fallback identifier (e.g. fallback = my_rust_impl)");
+    };
+
+    // collect argument idents to forward calls
+    let mut arg_names: Vec<proc_macro2::TokenStream> = Vec::new();
+    for input in &sig.inputs {
+        if let FnArg::Typed(pat_type) = input {
+            match &*pat_type.pat {
+                Pat::Ident(id) => {
+                    let nm = id.ident.clone();
+                    arg_names.push(quote! { #nm });
+                }
+                _ => {
+                    abort_call_site!("unsupported argument pattern in function signature");
+                }
+            }
+        }
+    }
+
+    // generate assert! statements from invariants expressions (use original syn::Expr tokens)
+    let mut assert_tokens = proc_macro2::TokenStream::new();
+    for inv in &attr.invariants {
+        let e = inv.clone();
+        assert_tokens.extend(quote! { assert!(#e); });
+    }
+
+    // Names for statics and probe function to avoid collisions
+    let once_ident = Ident::new(&format!("__{}_memsafe_once", fn_name_string), proc_macro2::Span::call_site());
+    let sel_ident = Ident::new(&format!("__{}_memsafe_sel", fn_name_string), proc_macro2::Span::call_site());
+    let probe_ident = Ident::new(&format!("__{}_memsafe_abi_probe", fn_name_string), proc_macro2::Span::call_site());
+
+    // ABI probe helper: best-effort attempt to detect callee-saved register clobber.
+    // This uses inline asm and is best-effort; segfaults cannot be caught.
+    let abi_probe_sample_size = attr.abi_probe_sample_size.unwrap_or(4096usize);
+    let abi_probe_enabled = attr.abi_probe;
+
+    // Derive a conservative sample size from invariants (e.g., `buf_len >= N`). If any
+    // invariant requires a larger buffer than the provided sample size, use the larger.
+    let mut probe_sample = abi_probe_sample_size;
+
+    // helper: try to evaluate an expression to a usize if it contains only integer
+    // literals and integer binary ops (+,-,*,/)
+    fn eval_usize_expr(e: &Expr) -> Option<usize> {
+        match e {
+            Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(i), .. }) => i.base10_parse::<usize>().ok(),
+            Expr::Unary(u) => match &u.op {
+                UnOp::Neg(_) => None,
+                UnOp::Not(_) => None,
+                _ => None,
+            },
+            Expr::Binary(b) => {
+                let l = eval_usize_expr(&b.left)?;
+                let r = eval_usize_expr(&b.right)?;
+                match b.op {
+                    BinOp::Add(_) => Some(l.wrapping_add(r)),
+                    BinOp::Sub(_) => l.checked_sub(r),
+                    BinOp::Mul(_) => Some(l.wrapping_mul(r)),
+                    BinOp::Div(_) => if r == 0 { None } else { Some(l / r) },
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    for inv in &attr.invariants {
+        if let syn::Expr::Binary(b) = inv {
+            match b.op {
+                BinOp::Ge(_) | BinOp::Gt(_) => {
+                    // prefer a right-hand constant if available
+                    if let Some(v) = eval_usize_expr(&b.right) { if v > probe_sample { probe_sample = v; } }
+                    else if let Some(v) = eval_usize_expr(&b.left) { if v > probe_sample { probe_sample = v; } }
+                }
+                _ => {}
+            }
+        }
+    }
+    let abi_probe_sample_size_ts = proc_macro2::Literal::usize_unsuffixed(probe_sample);
+
+    // Build an ABI probe that accepts a candidate function pointer matching the
+    // user's signature and constructs simple sample arguments:
+    // - raw pointer params receive `sample.as_mut_ptr() as <ptr-type>`
+    // - `usize` params receive `sample.len()`
+    // - integer params receive `0 as <int-type>`
+    // This is intentionally conservative and best-effort.
+    // Precompute parameter types and simple sample call arguments for the probe and
+    // for creating typed function-pointer bindings below.
+    let mut probe_param_tys: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut probe_call_args: Vec<proc_macro2::TokenStream> = Vec::new();
+    for input in &sig.inputs {
+        if let FnArg::Typed(pat_type) = input {
+            let ty = &*pat_type.ty;
+            probe_param_tys.push(quote! { #ty });
+            let arg_expr = match ty {
+                Type::Ptr(_) => quote! { sample.as_mut_ptr() as #ty },
+                Type::Reference(_) => quote! { sample.as_mut_ptr() as *mut _ as #ty },
+                Type::Path(p) => {
+                    let ident = p.path.segments.last().unwrap().ident.to_string();
+                    match ident.as_str() {
+                        "usize" => quote! { sample.len() },
+                        "isize" => quote! { sample.len() as isize },
+                        "u32" | "u64" | "u128" | "u16" | "u8" | "i32" | "i64" | "i128" | "i16" | "i8" => {
+                            quote! { 0 as #ty }
+                        }
+                        _ => quote! { 0 as #ty },
+                    }
+                }
+                _ => quote! { 0 as #ty },
+            };
+            probe_call_args.push(arg_expr);
+        }
+    }
+
+    let abi_probe_fn = if abi_probe_enabled {
+        // return type token stream for the probe (ensure explicit `-> T` form)
+        let probe_ret_ts: proc_macro2::TokenStream = match &sig.output {
+            ReturnType::Default => quote! { -> () },
+            ReturnType::Type(_, ty) => quote! { -> #ty },
+        };
+
+        quote! {
+            #[inline]
+            unsafe fn #probe_ident(candidate: unsafe extern "C" fn( #(#probe_param_tys),* ) #probe_ret_ts, sample_size: usize) -> bool {
+                use std::io::{Read, Write};
+
+                // create a pipe for parent-child communication
+                let mut fds: [i32;2] = [0,0];
+                extern "C" {
+                    fn pipe(fds: *mut i32) -> i32;
+                    fn fork() -> i32;
+                    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+                    fn _exit(code: i32) -> !;
+                    fn close(fd: i32) -> i32;
+                }
+
+                if pipe(fds.as_mut_ptr()) != 0 { return false; }
+
+                let pid = fork();
+                if pid == 0 {
+                    // child
+                    // close read end
+                    let _ = close(fds[0]);
+                    let mut sample = vec![0u8; sample_size];
+
+                    // capture regs before
+                    let (rbx_b, r12_b, r13_b, r14_b, r15_b, rsp_b): (u64,u64,u64,u64,u64,u64);
+                    core::arch::asm!(
+                        "mov {0}, rbx\n\tmov {1}, r12\n\tmov {2}, r13\n\tmov {3}, r14\n\tmov {4}, r15\n\tmov {5}, rsp",
+                        out(reg) rbx_b, out(reg) r12_b, out(reg) r13_b, out(reg) r14_b, out(reg) r15_b, out(reg) rsp_b
+                    );
+
+                    // write to pipe (use explicit type to avoid inference issues)
+                    let mut w: std::fs::File = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fds[1]) };
+                    let _ = w.write_all(&rbx_b.to_ne_bytes());
+                    let _ = w.write_all(&r12_b.to_ne_bytes());
+                    let _ = w.write_all(&r13_b.to_ne_bytes());
+                    let _ = w.write_all(&r14_b.to_ne_bytes());
+                    let _ = w.write_all(&r15_b.to_ne_bytes());
+                    let _ = w.write_all(&rsp_b.to_ne_bytes());
+
+                    // call candidate
+                    let _ = candidate( #(#probe_call_args),* );
+
+                    // capture regs after
+                    let (rbx_a, r12_a, r13_a, r14_a, r15_a, rsp_a): (u64,u64,u64,u64,u64,u64);
+                    core::arch::asm!(
+                        "mov {0}, rbx\n\tmov {1}, r12\n\tmov {2}, r13\n\tmov {3}, r14\n\tmov {4}, r15\n\tmov {5}, rsp",
+                        out(reg) rbx_a, out(reg) r12_a, out(reg) r13_a, out(reg) r14_a, out(reg) r15_a, out(reg) rsp_a
+                    );
+
+                    let _ = w.write_all(&rbx_a.to_ne_bytes());
+                    let _ = w.write_all(&r12_a.to_ne_bytes());
+                    let _ = w.write_all(&r13_a.to_ne_bytes());
+                    let _ = w.write_all(&r14_a.to_ne_bytes());
+                    let _ = w.write_all(&r15_a.to_ne_bytes());
+                    let _ = w.write_all(&rsp_a.to_ne_bytes());
+                    // ensure data is flushed and fd closed
+                    drop(w);
+                    unsafe { _exit(0); }
+                } else if pid > 0 {
+                    // parent
+                    // close write end
+                    let _ = close(fds[1]);
+                    // wait for child
+                    let mut status: i32 = 0;
+                    let _ = waitpid(pid, &mut status as *mut i32, 0);
+                    // if child terminated due to signal -> failure
+                    if (status & 0x7f) != 0 { let _ = close(fds[0]); return false; }
+
+                    // read before/after registers (6 u64 before, 6 u64 after)
+                    let mut r: std::fs::File = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fds[0]) };
+                    let mut buf_before = [0u8; 8*6];
+                    let mut buf_after = [0u8; 8*6];
+                    use std::io::Read;
+                    if let Err(_) = r.read_exact(&mut buf_before) { return false; }
+                    if let Err(_) = r.read_exact(&mut buf_after) { return false; }
+
+                    let mut u64_from = |b: &[u8]| -> [u64;6] {
+                        let mut out = [0u64;6];
+                        for i in 0..6 { let mut arr = [0u8;8]; arr.copy_from_slice(&b[i*8..i*8+8]); out[i] = u64::from_ne_bytes(arr); }
+                        out
+                    };
+                    let before = u64_from(&buf_before);
+                    let after = u64_from(&buf_after);
+                    // compare registers: all must be preserved
+                    let preserved = before[0]==after[0] && before[1]==after[1] && before[2]==after[2] && before[3]==after[3] && before[4]==after[4] && before[5]==after[5];
+                    let _ = close(fds[0]);
+                    return preserved;
+                } else {
+                    // fork failed
+                    let _ = close(fds[0]);
+                    let _ = close(fds[1]);
+                    return false;
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // (no typed candidate cast helper here)
+
+    // build.rs snippet for user to copy/paste
+    // Build.rs snippet will be emitted after proving variants (below)
+
+    // generate the wrapper function; selection logic implemented per-variant below
+
+    // Build extern declarations for each variant and selection logic
+    let mut extern_blocks = proc_macro2::TokenStream::new();
+    // We'll also prepare typed local bindings inside the wrapper that cast the
+    // extern items to concrete function-pointer types derived from the signature.
+    let mut typed_bindings_ts = proc_macro2::TokenStream::new();
+    // Build the function-pointer type tokenstream for the wrapper signature
+    let mut param_tys_for_ptr: Vec<proc_macro2::TokenStream> = Vec::new();
+    for input in &sig.inputs {
+        if let FnArg::Typed(pt) = input { let ty = &*pt.ty; param_tys_for_ptr.push(quote! { #ty }); }
+    }
+    // Normalize return type: ensure we always produce an explicit `-> Type` tokenstream
+    // for building function-pointer types. If the function returns nothing, use `()`.
+    let ret_ts: proc_macro2::TokenStream = match &sig.output {
+        ReturnType::Default => quote! { -> () },
+        ReturnType::Type(_, ty) => {
+            quote! { -> #ty }
+        }
+    };
+
+    // Build a list of parameter declarations (patterns with types) for extern decls
+    let mut param_decls: Vec<proc_macro2::TokenStream> = Vec::new();
+    for input in &sig.inputs {
+        if let FnArg::Typed(pt) = input {
+            param_decls.push(quote! { #pt });
+        }
+    }
+
+    for v in &variants {
+        let extern_ident = v.rust_ident.clone();
+        let sym_lit = syn::LitStr::new(&v.symbol_str, proc_macro2::Span::call_site());
+        // Emit extern declaration with explicit return type tokenstream (ret_ts)
+        extern_blocks.extend(quote! {
+            extern "C" { #[link_name = #sym_lit] fn #extern_ident( #(#param_decls),* ) #ret_ts; }
+        });
+
+        // typed binding name
+        let bind_ident = Ident::new(&format!("__asm_ptr_{}", v.rust_ident), proc_macro2::Span::call_site());
+        // the extern item is named v.rust_ident; create a static fn-pointer binding with explicit type
+        let extern_ident = v.rust_ident.clone();
+        typed_bindings_ts.extend(quote! {
+            static #bind_ident: unsafe extern "C" fn( #(#param_tys_for_ptr),* ) #ret_ts = #extern_ident as unsafe extern "C" fn( #(#param_tys_for_ptr),* ) #ret_ts;
+        });
+    }
+
+    // Prepare ABI probe boolean literal for generated code
+    let abi_probe_lit_ts = if abi_probe_enabled { quote! { true } } else { quote! { false } };
+
+    // Build feature checks and selection arms
+    let mut selection_arms = proc_macro2::TokenStream::new();
+    for (idx, v) in variants.iter().enumerate() {
+        let _ident = &v.rust_ident;
+        let bind_ident_name = format!("__asm_ptr_{}", v.rust_ident);
+        let bind_ident = Ident::new(&bind_ident_name, proc_macro2::Span::call_site());
+        let idx_lit = idx as u8;
+        if v.features.is_empty() {
+            // always-available candidate
+            if abi_probe_enabled {
+                selection_arms.extend(quote! {
+                    // candidate without feature requirement; only choose if none chosen yet
+                    if chosen == 255u8 {
+                        if unsafe { #probe_ident(#bind_ident, #abi_probe_sample_size_ts) } {
+                            chosen = #idx_lit;
+                        }
+                    }
+                });
+            } else {
+                // choose only if none chosen yet (preserve user order -> first wins)
+                selection_arms.extend(quote! { if chosen == 255u8 { chosen = #idx_lit; } });
+            }
+        } else {
+            // build combined feature check
+            let mut feats_ts = proc_macro2::TokenStream::new();
+            for f in &v.features {
+                let lit = syn::LitStr::new(&f, proc_macro2::Span::call_site());
+                feats_ts.extend(quote! { std::is_x86_feature_detected!(#lit) && });
+            }
+            // remove trailing && by wrapping in a block
+            selection_arms.extend(quote! {
+                if { let cond = { #feats_ts true }; cond } {
+                    if chosen == 255u8 {
+                        if #abi_probe_lit_ts {
+                            if unsafe { #probe_ident(#bind_ident, #abi_probe_sample_size_ts) } { chosen = #idx_lit; }
+                        } else {
+                            chosen = #idx_lit;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // build environment override detection code
+    let mut env_override_ts = proc_macro2::TokenStream::new();
+    // allow overriding by symbol name or feature name
+    let mut override_arms = proc_macro2::TokenStream::new();
+    for (idx, v) in variants.iter().enumerate() {
+        let idx_lit = idx as u8;
+        let sym = &v.symbol_str;
+        let sym_lit = syn::LitStr::new(sym, proc_macro2::Span::call_site());
+        override_arms.extend(quote! {
+            if val == #sym_lit { chosen = #idx_lit; }
+        });
+        for feat in &v.features {
+            let feat_lit = syn::LitStr::new(feat, proc_macro2::Span::call_site());
+            override_arms.extend(quote! {
+                if val == #feat_lit { chosen = #idx_lit; }
+            });
+        }
+    }
+    env_override_ts.extend(quote! {
+        if let Ok(val) = std::env::var("BUMS_FORCE_IMPL") {
+            #override_arms
+        }
+    });
+
+    // Emit a build.rs snippet to help the user copy assembly files into OUT_DIR and compile them with cc
+    // Collect unique filenames
+    let mut uniq_files = std::collections::HashSet::new();
+    for v in &variants { uniq_files.insert(v.filename.clone()); }
+    let mut snippet = String::new();
+    snippet.push_str("// Paste this into your build.rs to copy asm files into OUT_DIR and assemble them with cc::Build\n");
+    snippet.push_str("use std::path::PathBuf; use std::fs;\nfn main() {\n    let out = PathBuf::from(std::env::var(\"OUT_DIR\").unwrap());\n    fs::create_dir_all(&out).unwrap();\n");
+    for f in uniq_files {
+        let dst = f.clone();
+        let src = format!("../../{}", f);
+        let compile_name = dst.replace('.', "_");
+        snippet.push_str(&format!("    let src = PathBuf::from(\"{}\");\n    let dst = out.join(\"{}\");\n    let _ = fs::copy(&src, &dst).expect(\"copy asm\");\n    cc::Build::new().file(dst).flag_if_supported(\"-masm=intel\").compile(\"{}\");\n\n", src, dst, compile_name));
+    }
+    snippet.push_str("}\n");
+    emit_call_site_warning!(format!("memsafe_multiversion build.rs snippet:\n{}", snippet));
+
+    // selection code executed once
+    let selection_block = quote! {
+        #once_ident.call_once(|| {
+            let mut chosen: u8 = 255u8; // 255 = none
+            // env override
+            #env_override_ts
+            if chosen == 255u8 {
+                // try each candidate in user order
+                #selection_arms
+            }
+            // if still none, fallback is represented by 255
+            unsafe { #sel_ident = chosen; }
+        });
+    };
+
+    // dispatch code: if sel < variants.len() call that variant else fallback
+    // Use the typed local bindings created earlier (__asm_ptr_<ident>) to ensure
+    // the call sites have fully concrete types and do not require inference.
+    let mut dispatch_match = proc_macro2::TokenStream::new();
+    for (idx, v) in variants.iter().enumerate() {
+        let idx_lit = idx as u8;
+        let bind_ident = Ident::new(&format!("__asm_ptr_{}", v.rust_ident), proc_macro2::Span::call_site());
+        dispatch_match.extend(quote! {
+            if sel == #idx_lit { unsafe { return #bind_ident( #(#arg_names),* ); } }
+        });
+    }
+
+    let output = quote! {
+        #extern_blocks
+
+        #abi_probe_fn
+
+        #typed_bindings_ts
+
+        static #once_ident: std::sync::Once = std::sync::Once::new();
+        static mut #sel_ident: u8 = 255u8;
+
+        #vis #sig {
+        #assert_tokens
+            #selection_block
+            let sel = unsafe { #sel_ident };
+            #dispatch_match
+            // fallback
+            return #fallback_ident( #(#arg_names),* );
+        }
+    };
+
+    // For debugging: try to write the generated output to OUT_DIR/<fn>_expanded.rs
+    let _ = std::panic::catch_unwind(|| {
+        if let Ok(outdir) = std::env::var("OUT_DIR") {
+            let mut path = std::path::PathBuf::from(outdir);
+            path.push(format!("{}_memsafe_expanded.rs", fn_name_string));
+            let _ = std::fs::write(path, output.to_string());
+        }
+        // Also write a copy to /tmp to aid debugging in test runs
+        let _ = std::panic::catch_unwind(|| {
+            let _ = std::fs::write(format!("/tmp/{}_memsafe_expanded.rs", fn_name_string), output.to_string());
+        });
+    });
+    output.into()
 }

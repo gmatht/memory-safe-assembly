@@ -3,6 +3,9 @@ pub mod computer;
 pub mod engine;
 pub mod instruction_parser;
 
+#[cfg(feature = "x86")]
+pub mod x86_64;
+
 #[macro_export]
 macro_rules! extract_three_registers {
     ($self:ident, $instruction:ident) => {{

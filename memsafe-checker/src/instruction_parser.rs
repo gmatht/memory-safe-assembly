@@ -62,7 +62,7 @@ pub enum Operand {
         Option<Box<Operand>>,
         Option<bool>,
     ), // like [x0, #16] // bool to represent pre/post index false = pre, true = post
-    Bitwise(String, i64), // like lsl#2, TODO: make enum for shift types
+    Bitwise(ShiftType, i64), // like lsl#2
     // the "string" param is probably always going to be "v"
     VectorRegister(RePrefix, usize),
     Vector(RePrefix, usize, Arrangement),
@@ -70,6 +70,48 @@ pub enum Operand {
     Label(String),
     Address(String, i64), // for relative addresses, i.e. LK256@PAGEOFF
     Other,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShiftType {
+    Lsl,
+    Lsr,
+    Asr,
+    Ror,
+    Uxtw,
+    Uxtb,
+    Uxth,
+    Other(String),
+}
+
+impl ShiftType {
+    pub fn from_str(s: &str) -> ShiftType {
+        match s {
+            "lsl" => ShiftType::Lsl,
+            "lsr" => ShiftType::Lsr,
+            "asr" => ShiftType::Asr,
+            "ror" => ShiftType::Ror,
+            "uxtw" => ShiftType::Uxtw,
+            "uxtb" => ShiftType::Uxtb,
+            "uxth" => ShiftType::Uxth,
+            other => ShiftType::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ShiftType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShiftType::Lsl => write!(f, "lsl"),
+            ShiftType::Lsr => write!(f, "lsr"),
+            ShiftType::Asr => write!(f, "asr"),
+            ShiftType::Ror => write!(f, "ror"),
+            ShiftType::Uxtw => write!(f, "uxtw"),
+            ShiftType::Uxtb => write!(f, "uxtb"),
+            ShiftType::Uxth => write!(f, "uxth"),
+            ShiftType::Other(s) => write!(f, "{}", s),
+        }
+    }
 }
 pub fn register_to_tuple(r: &Operand) -> (RePrefix, usize) {
     match r.clone() {
@@ -128,7 +170,8 @@ pub fn operand_from_string(a: String) -> Operand {
     }
 
     if a.contains('@') {
-        // TODO: extrapolate offset based on context
+        // NOTE: address tokens with '@' are parsed as Address and offset
+        // inference is handled by later stages when more context is available.
         return Operand::Address(a, 0);
     }
 
@@ -141,21 +184,20 @@ pub fn operand_from_string(a: String) -> Operand {
             .expect("need some strings in shift parsing")
             .is_empty()
         {
-            return Operand::Bitwise(
-                parts
-                    .next()
-                    .expect("need part before # in shift parsing")
-                    .to_string(),
-                parts
-                    .next()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .expect("need part after # in shift parsing"),
-            );
+            let op = parts
+                .next()
+                .expect("need part before # in shift parsing")
+                .to_string();
+            let num = parts
+                .next()
+                .and_then(|s| s.parse::<i64>().ok())
+                .expect("need part after # in shift parsing");
+            return Operand::Bitwise(ShiftType::from_str(&op), num);
         }
     }
 
     if a == "uxtw" || a == "uxtb" || a == "uxth" {
-        return Operand::Bitwise(a, 0);
+        return Operand::Bitwise(ShiftType::from_str(&a), 0);
     }
 
     if a.starts_with("v") {
@@ -173,7 +215,8 @@ pub fn operand_from_string(a: String) -> Operand {
                         .expect("size indication required for index into vector"),
                 );
                 let index = string_to_int(parts.next().expect("index required"));
-                // TODO: maybe runtime check index is valid for arrangement?
+                // NOTE: could add runtime validation that the index is valid for the
+                // chosen Arrangement; left as a future enhancement.
 
                 let parts = base.split_at(1);
                 let i = parts
@@ -207,8 +250,6 @@ pub fn operand_from_string(a: String) -> Operand {
         let parts = a.split_at(1);
         if let Ok(value) = parts.1.parse::<usize>() {
             return Operand::VectorRegister(RePrefix::V, value);
-        } else {
-            ()
         }
     }
 
@@ -233,8 +274,6 @@ pub fn operand_from_string(a: String) -> Operand {
 
         if let Ok(value) = parts.1.parse::<usize>() {
             return Operand::Vector(RePrefix::V, value, arr);
-        } else {
-            ();
         }
     }
 
@@ -287,7 +326,8 @@ pub fn operand_from_string(a: String) -> Operand {
             }
         };
 
-        // TODO: include shift
+        // NOTE: shift parsing for these operands is handled elsewhere; include
+        // shift here if we need to attach it to the operand directly.
         return Operand::Memory(prefix, num, offset, register_offset, indexing);
     }
 
@@ -492,7 +532,7 @@ mod tests {
                 Operand::Register(RePrefix::X, 0),
                 Operand::Register(RePrefix::X, 0),
                 Operand::Immediate(2),
-                Operand::Bitwise(String::from("lsl"), 12),
+                Operand::Bitwise(ShiftType::Lsl, 12),
             ]),
         };
 
@@ -716,7 +756,7 @@ mod tests {
             operands: Vec::from([
                 Operand::Register(RePrefix::X, 0),
                 Operand::Register(RePrefix::X, 1),
-                Operand::Bitwise(String::from("lsr"), 2),
+                Operand::Bitwise(ShiftType::Lsr, 2),
             ]),
         };
         assert_eq!(Instruction::new("cmp x0,x1,lsr#2".to_string()), good_result);

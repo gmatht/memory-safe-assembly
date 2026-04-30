@@ -1,0 +1,12 @@
+error: No such file or directory (os error 2)
+  --> tests/compile-fail/clobber_rbx.rs:5:1
+   |
+ 5 | / #[memsafe_multiversion(
+ 6 | |     versions = [("testdata/clobber_rbx.s", "clobber_rbx", [])],
+ 7 | |     fallback = clobber_rbx_fallback,
+ 8 | |     invariants = [],
+ 9 | |     abi_probe = false
+10 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `memsafe_multiversion` (in Nightly builds, run with -Z macro-backtrace for more info)

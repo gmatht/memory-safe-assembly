@@ -6,3 +6,17 @@ scrape-asm/lib
 scrape-asm/hashes
 crypto-playground/bin
 crypto-playground/lib
+memsafe-checker/target
+
+# Editor swap / temp files
+*.swp
+*~
+*.tmp
+*.bak
+
+# IDEs
+.idea/
+
+# Project-generated artifacts (assembly / logs)
+# memsafe-checker/*.s
+memsafe-checker/*.log

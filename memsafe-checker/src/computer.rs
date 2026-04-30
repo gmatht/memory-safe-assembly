@@ -27,13 +27,18 @@ pub struct ARMCORTEXA<'ctx> {
 
 impl<'ctx> fmt::Debug for ARMCORTEXA<'ctx> {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        println!("registers {:#?}", &self.registers);
-        println!("simd registers {:?}", &self.simd_registers);
-        Ok(())
+        // Provide a compact Debug implementation that writes to the formatter.
+        // Avoid printing directly to stdout during Debug formatting.
+        write!(
+            _f,
+            "ARMCORTEXA {{ registers: <{} regs>, simd_registers: <{} simd> }}",
+            self.registers.len(),
+            self.simd_registers.len()
+        )
     }
 }
 
-impl<'ctx> ARMCORTEXA<'_> {
+impl<'ctx> ARMCORTEXA<'ctx> {
     pub fn new(context: &'ctx Context) -> ARMCORTEXA<'ctx> {
         let registers = [
             RegisterValue::new_empty("x0"),
@@ -110,7 +115,7 @@ impl<'ctx> ARMCORTEXA<'_> {
             SimdRegister::new("v31"),
         ];
 
-        let solver = Solver::new(&context);
+        let solver = Solver::new(context);
         let mut memory = HashMap::new();
 
         let max = ast::Int::from_i64(context, i64::MAX);
@@ -151,14 +156,14 @@ impl<'ctx> ARMCORTEXA<'_> {
         Option<FlagValue>,
         Option<FlagValue>,
     ) {
-        return (
+        (
             self.registers.clone(),
             // self.simd_registers.clone(),
             self.zero.clone(),
             self.neg.clone(),
             self.carry.clone(),
             self.overflow.clone(),
-        );
+        )
     }
 
     pub fn set_immediate(&mut self, register: String, value: u64) {
@@ -188,11 +193,7 @@ impl<'ctx> ARMCORTEXA<'_> {
         let stack = self.memory.get_mut("sp").expect("Stack not found");
         stack.insert(
             address,
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base,
-                offset,
-            },
+            RegisterValue::new(RegisterKind::RegisterBase, base, offset),
         );
     }
 
@@ -264,7 +265,7 @@ impl<'ctx> ARMCORTEXA<'_> {
     }
 
     pub fn get_register(&mut self, reg: &Operand) -> RegisterValue {
-        return match reg {
+        match reg {
             // TODO: reimplement accessing half a register using w
             Operand::Register(prefix, index) => match prefix {
                 RePrefix::Fp => self.registers[29].clone(),
@@ -281,7 +282,7 @@ impl<'ctx> ARMCORTEXA<'_> {
                 self.simd_registers[*index].clone().get_as_register()
             }
             a => panic!("Not a valid register operand for get operation {:?}", a),
-        };
+        }
     }
 
     pub fn get_simd_register(&mut self, reg: &Operand) -> SimdRegister {
@@ -290,7 +291,7 @@ impl<'ctx> ARMCORTEXA<'_> {
             Operand::Vector(_, index, _) => self.simd_registers[*index].clone(),
             Operand::VectorAccess(_, index, _, _) => {
                 // FIX
-                return self.simd_registers[*index].clone();
+                self.simd_registers[*index].clone()
             }
             _ => panic!("cannot get register {:?} as a simd register", reg),
         }
@@ -435,11 +436,11 @@ mod tests {
         let result = computer.get_register(&Operand::Register(RePrefix::X, 0));
         assert_eq!(
             result,
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base: Some(AbstractExpression::Abstract("hello,".to_string())),
-                offset: 5,
-            }
+            RegisterValue::new(
+                RegisterKind::RegisterBase,
+                Some(AbstractExpression::Abstract("hello,".to_string())),
+                5,
+            )
         );
     }
 
@@ -465,15 +466,15 @@ mod tests {
         let result = computer.get_register(&Operand::Register(RePrefix::X, 0));
         assert_eq!(
             result,
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base: Some(generate_expression(
+            RegisterValue::new(
+                RegisterKind::RegisterBase,
+                Some(generate_expression(
                     "+",
                     AbstractExpression::Abstract("hello,".to_string()),
-                    AbstractExpression::Abstract("world!".to_string())
+                    AbstractExpression::Abstract("world!".to_string()),
                 )),
-                offset: 0,
-            }
+                0,
+            )
         );
     }
 
@@ -499,11 +500,11 @@ mod tests {
         let result = computer.get_register(&Operand::Register(RePrefix::X, 0));
         assert_eq!(
             result,
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base: Some(AbstractExpression::Abstract("hello,".to_string())),
-                offset: 12,
-            }
+            RegisterValue::new(
+                RegisterKind::RegisterBase,
+                Some(AbstractExpression::Abstract("hello,".to_string())),
+                12,
+            )
         );
     }
 
@@ -523,11 +524,11 @@ mod tests {
         let result = computer.get_register(&Operand::Register(RePrefix::X, 0));
         assert_eq!(
             result,
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base: Some(AbstractExpression::Abstract("hello,".to_string())),
-                offset: 7,
-            }
+            RegisterValue::new(
+                RegisterKind::RegisterBase,
+                Some(AbstractExpression::Abstract("hello,".to_string())),
+                7,
+            )
         );
     }
 }

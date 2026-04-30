@@ -2,8 +2,10 @@
 members = [
   "bums_macros",
   "memsafe-checker",
+  "verify_asm",
   "crypto-playground",
-  "rav1d-playground"
+  "rav1d-playground",
+  "x86_macro_test"
 ]
 exclude = ["scrape-asm"]
 resolver = "2"

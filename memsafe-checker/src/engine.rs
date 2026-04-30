@@ -801,12 +801,7 @@ impl<'ctx> ExecutionEngine<'ctx> {
                                 )),
                             );
 
-                            let new_reg = RegisterValue {
-                                kind: cur.kind.clone(),
-                                base: Some(new_base),
-                                offset: 0,
-                            };
-
+                            let new_reg = RegisterValue::new(cur.kind.clone(), Some(new_base), 0);
                             self.computer.registers[i] = new_reg;
 
                             if diff > max_diff {
@@ -907,11 +902,8 @@ impl<'ctx> ExecutionEngine<'ctx> {
                         if let Some(base) = &cur.base {
                             if base.contains(&loop_var_name) && base.contains_expression(&base_step)
                             {
-                                let new_reg = RegisterValue {
-                                    kind: cur.kind.clone(),
-                                    base: cur.base.clone(),
-                                    offset: 0,
-                                };
+                                let new_reg =
+                                    RegisterValue::new(cur.kind.clone(), cur.base.clone(), 0);
                                 self.computer.registers[i] = new_reg;
                             }
                         }
@@ -1034,15 +1026,15 @@ mod tests {
         let _ = engine.start("start".to_string());
         assert_eq!(
             engine.computer.registers[0],
-            RegisterValue {
-                kind: RegisterKind::RegisterBase,
-                base: Some(generate_expression(
+            RegisterValue::new(
+                RegisterKind::RegisterBase,
+                Some(generate_expression(
                     "+",
                     AbstractExpression::Abstract("x1".to_string()),
-                    AbstractExpression::Abstract("x2".to_string())
+                    AbstractExpression::Abstract("x2".to_string()),
                 )),
-                offset: 0,
-            }
+                0,
+            )
         )
     }
 }

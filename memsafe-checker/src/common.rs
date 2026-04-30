@@ -16,11 +16,26 @@ pub struct RegisterValue {
     pub kind: RegisterKind,
     pub base: Option<AbstractExpression>,
     pub offset: i64,
+    // bitmask of known bits within the canonical 64-bit register (1=known)
+    pub known_mask: u64,
+    // known bits value (valid where known_mask has 1s)
+    pub known_value: u64,
 }
 
 impl RegisterValue {
     pub fn new(kind: RegisterKind, base: Option<AbstractExpression>, offset: i64) -> Self {
-        Self { kind, base, offset }
+        let mut kv = Self {
+            kind,
+            base,
+            offset,
+            known_mask: 0u64,
+            known_value: 0u64,
+        };
+        if kv.kind == RegisterKind::Immediate {
+            kv.known_mask = !0u64;
+            kv.known_value = kv.offset as u64;
+        }
+        kv
     }
 
     pub fn new_empty(name: &str) -> Self {
@@ -28,6 +43,8 @@ impl RegisterValue {
             kind: RegisterKind::RegisterBase,
             base: Some(AbstractExpression::Abstract(name.to_string())),
             offset: 0,
+            known_mask: 0u64,
+            known_value: 0u64,
         }
     }
 
@@ -36,6 +53,26 @@ impl RegisterValue {
             kind: RegisterKind::Immediate,
             base: None,
             offset: num,
+            known_mask: !0u64,
+            known_value: num as u64,
+        }
+    }
+
+    /// Construct a RegisterValue with explicit known_mask/known_value.
+    /// Useful for callers that want to set known bits at creation time.
+    pub fn with_known(
+        kind: RegisterKind,
+        base: Option<AbstractExpression>,
+        offset: i64,
+        known_mask: u64,
+        known_value: u64,
+    ) -> Self {
+        Self {
+            kind,
+            base,
+            offset,
+            known_mask,
+            known_value,
         }
     }
 
@@ -43,10 +80,31 @@ impl RegisterValue {
         self.kind = kind;
         self.base = base;
         self.offset = offset;
+        // adjust known mask/value: full-known when immediate, otherwise clear
+        if self.kind == RegisterKind::Immediate {
+            self.known_mask = !0u64;
+            self.known_value = self.offset as u64;
+        } else {
+            self.known_mask = 0u64;
+            self.known_value = 0u64;
+        }
+    }
+
+    /// Set known bits (mask, value) merging with existing known bits.
+    pub fn set_known_bits(&mut self, mask: u64, value: u64) {
+        // update known_value only at mask bits, merge mask
+        self.known_value = (self.known_value & !mask) | (value & mask);
+        self.known_mask |= mask;
+        // if all bits known, promote to Immediate
+        if self.known_mask == !0u64 {
+            self.kind = RegisterKind::Immediate;
+            self.offset = self.known_value as i64;
+        }
     }
 }
 
-// TODO: add way to mark endianess if necessary
+// Note: per-byte memory model is used throughout; add endian flag if
+// needs arise for other targets or different memory representations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimdRegister {
     pub kind: RegisterKind,
@@ -73,21 +131,23 @@ impl SimdRegister {
     }
 
     //https://developer.arm.com/documentation/102474/0100/Fundamentals-of-Armv8-Neon-technology/Registers--vectors--lanes-and-elements
-    // TODO: unclear whether we need to use these getters and setters in this way when actually doing SIMD,
-    // to be fixed once implement interpreter and instructions,
+    // NOTE: these getters/setters are convenient helpers for SIMD lane handling.
+    // They may be revised once the SIMD instruction implementations require
+    // a different abstraction (e.g., more explicit lane typing).
     // at least useful for setting/getting scalars from vectors if necessary
     // i.e. V3.S[2]  -> get_word(2)
     pub fn get_byte(&self, index: usize) -> (Option<AbstractExpression>, u8) {
         assert!(index < 16);
-        return (self.base[index].clone(), self.offset[index]);
+        (self.base[index].clone(), self.offset[index])
     }
     pub fn get_halfword(&self, index: usize) -> ([Option<AbstractExpression>; 2], [u8; 2]) {
         assert!(index <= 8);
         let index = index * 2;
-        let base: [Option<AbstractExpression>; 2] =
-            [self.base[index].clone(), self.base[index + 1].clone()];
-        let offset: [u8; 2] = [self.offset[index], self.offset[index + 1]];
-        return (base, offset);
+        let mut base: [Option<AbstractExpression>; 2] = Default::default();
+        base.clone_from_slice(&self.base[index..(index + 2)]);
+        let mut offset: [u8; 2] = Default::default();
+        offset.copy_from_slice(&self.offset[index..(index + 2)]);
+        (base, offset)
     }
 
     pub fn get_word(&self, index: usize) -> ([Option<AbstractExpression>; 4], [u8; 4]) {
@@ -96,8 +156,8 @@ impl SimdRegister {
         let mut base: [Option<AbstractExpression>; 4] = Default::default();
         base.clone_from_slice(&self.base[index..(index + 4)]);
         let mut offset: [u8; 4] = Default::default();
-        offset.clone_from_slice(&self.offset[index..(index + 4)]);
-        return (base, offset);
+        offset.copy_from_slice(&self.offset[index..(index + 4)]);
+        (base, offset)
     }
 
     pub fn get_double(&self, index: usize) -> ([Option<AbstractExpression>; 8], [u8; 8]) {
@@ -106,8 +166,8 @@ impl SimdRegister {
         let mut base: [Option<AbstractExpression>; 8] = Default::default();
         base.clone_from_slice(&self.base[index..(index + 8)]);
         let mut offset: [u8; 8] = Default::default();
-        offset.clone_from_slice(&self.offset[index..(index + 8)]);
-        return (base, offset);
+        offset.copy_from_slice(&self.offset[index..(index + 8)]);
+        (base, offset)
     }
 
     pub fn set_byte(&mut self, index: usize, base: Option<AbstractExpression>, offset: u8) {
@@ -123,10 +183,8 @@ impl SimdRegister {
     ) {
         assert!(index <= 8);
         let index = index * 2;
-        for i in 0..2 {
-            self.base[index + i] = base[i].clone();
-            self.offset[index + i] = offset[i];
-        }
+        self.base[index..(2 + index)].clone_from_slice(&base);
+        self.offset[index..(2 + index)].copy_from_slice(&offset);
     }
 
     pub fn set_word(
@@ -137,10 +195,8 @@ impl SimdRegister {
     ) {
         assert!(index < 4);
         let index = index * 4;
-        for i in 0..4 {
-            self.base[index + i] = base[i].clone();
-            self.offset[index + i] = offset[i];
-        }
+        self.base[index..(4 + index)].clone_from_slice(&base);
+        self.offset[index..(4 + index)].copy_from_slice(&offset);
     }
 
     pub fn set_double(
@@ -151,10 +207,8 @@ impl SimdRegister {
     ) {
         assert!(index < 2);
         let index = index * 8;
-        for i in 0..8 {
-            self.base[index + i] = base[i].clone();
-            self.offset[index + i] = offset[i];
-        }
+        self.base[index..(8 + index)].clone_from_slice(&base);
+        self.offset[index..(8 + index)].copy_from_slice(&offset);
     }
 
     pub fn set_from_register(
@@ -182,7 +236,8 @@ impl SimdRegister {
                 } else {
                     self.base = [BASE_INIT; 16];
                 }
-                self.offset = [(offset as u8).try_into().expect("conversion to u8 failed"); 16];
+                let o = offset as u8;
+                self.offset = [o; 16];
             }
             Arrangement::H8 => {
                 let offset = offset as u16;
@@ -288,11 +343,12 @@ impl SimdRegister {
             ),
         );
 
-        return RegisterValue {
-            kind: self.kind.clone(),
-            base,
-            offset,
-        };
+        let mut rv = RegisterValue::new(self.kind.clone(), base, offset);
+        // If this SIMD register has an implied known value via offset, propagate
+        // no known bits by default (SIMD lanes are usually abstract).
+        rv.known_mask = 0u64;
+        rv.known_value = 0u64;
+        rv
     }
 }
 
@@ -310,13 +366,13 @@ pub fn generate_expression_from_options(
     b: Option<AbstractExpression>,
 ) -> Option<AbstractExpression> {
     if a.is_some() || b.is_some() {
-        return Some(generate_expression(
+        Some(generate_expression(
             op,
             a.clone().unwrap_or(AbstractExpression::Immediate(0)),
             b.clone().unwrap_or(AbstractExpression::Immediate(0)),
-        ));
+        ))
     } else {
-        return None;
+        None
     }
 }
 
@@ -378,21 +434,15 @@ impl AbstractExpression {
 
     pub fn contains(&self, token: &str) -> bool {
         match self {
-            AbstractExpression::Abstract(value) => {
-                if value.contains(token) {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
+            AbstractExpression::Abstract(value) => value.contains(token),
             AbstractExpression::Register(reg) => match &reg.base {
-                Some(e) => return e.contains(token),
-                None => return false,
+                Some(e) => e.contains(token),
+                None => false,
             },
             AbstractExpression::Expression(_, arg1, arg2) => {
-                return arg1.contains(token) || arg2.contains(token);
+                arg1.contains(token) || arg2.contains(token)
             }
-            _ => return false,
+            _ => false,
         }
     }
 
@@ -402,9 +452,9 @@ impl AbstractExpression {
         }
         match self {
             AbstractExpression::Expression(_, arg1, arg2) => {
-                return arg1.contains_expression(expr) || arg2.contains_expression(expr);
+                arg1.contains_expression(expr) || arg2.contains_expression(expr)
             }
-            _ => return false,
+            _ => false,
         }
     }
 }
@@ -419,6 +469,13 @@ pub fn generate_comparison(
         left: Box::new(a),
         right: Box::new(b),
     }
+}
+
+/// Trait used by common utilities to query register values from a target-specific
+/// computer implementation. This avoids hard dependency on a concrete X86Computer
+/// type inside common.rs so the crate can compile with or without the x86 feature.
+pub trait RegisterProvider {
+    fn get_register_value(&self, name: &str) -> RegisterValue;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -441,24 +498,12 @@ impl AbstractComparison {
         let left = *self.left.clone();
         let right = *self.right.clone();
         match self.op.as_str() {
-            "<" => {
-                return Self::new(">=", left, right);
-            }
-            ">" => {
-                return Self::new("<=", left, right);
-            }
-            ">=" => {
-                return Self::new("<", left, right);
-            }
-            "<=" => {
-                return Self::new(">", left, right);
-            }
-            "==" => {
-                return Self::new("!=", left, right);
-            }
-            "!=" => {
-                return Self::new("==", left, right);
-            }
+            "<" => Self::new(">=", left, right),
+            ">" => Self::new("<=", left, right),
+            ">=" => Self::new("<", left, right),
+            "<=" => Self::new(">", left, right),
+            "==" => Self::new("!=", left, right),
+            "!=" => Self::new("==", left, right),
             _ => todo!("unsupported op {:?}", self.op),
         }
     }
@@ -475,7 +520,7 @@ impl AbstractComparison {
     }
 
     pub fn contains(&self, token: &str) -> bool {
-        return self.left.contains(token) || self.right.contains(token);
+        self.left.contains(token) || self.right.contains(token)
     }
 }
 
@@ -509,7 +554,7 @@ pub enum FlagValue {
 impl FlagValue {
     pub fn to_abstract_expression(&self) -> AbstractComparison {
         match self {
-            Self::Abstract(a) => return a.clone(),
+            Self::Abstract(a) => a.clone(),
             Self::Real(r) => match r {
                 true => {
                     generate_comparison("==", AbstractExpression::Empty, AbstractExpression::Empty)
@@ -523,8 +568,8 @@ impl FlagValue {
 
     pub fn not(&self) -> Self {
         match self {
-            Self::Abstract(a) => return Self::Abstract(a.clone().not()),
-            Self::Real(r) => return Self::Real(!r),
+            Self::Abstract(a) => Self::Abstract(a.clone().not()),
+            Self::Real(r) => Self::Real(!r),
         }
     }
 }
@@ -532,9 +577,9 @@ impl FlagValue {
 impl PartialEq for FlagValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (FlagValue::Abstract(a), FlagValue::Abstract(b)) => return a == b,
-            (FlagValue::Real(a), FlagValue::Real(b)) => return a == b,
-            _ => return false,
+            (FlagValue::Abstract(a), FlagValue::Abstract(b)) => a == b,
+            (FlagValue::Real(a), FlagValue::Real(b)) => a == b,
+            _ => false,
         }
     }
 }
@@ -566,13 +611,11 @@ pub struct MemorySafeRegion {
 impl MemorySafeRegion {
     pub fn new(length: AbstractExpression, kind: RegionType) -> Self {
         let mut content = HashMap::new();
-        match length {
-            AbstractExpression::Immediate(l) => {
-                for i in 0..(l) {
-                    content.insert(i * 4, RegisterValue::new(RegisterKind::Number, None, 0));
-                }
+        if let AbstractExpression::Immediate(l) = length {
+            // initialize per-byte content entries for the region length
+            for i in 0..(l) {
+                content.insert(i, RegisterValue::new(RegisterKind::Number, None, 0));
             }
-            _ => (),
         }
         Self {
             kind,
@@ -586,8 +629,8 @@ impl MemorySafeRegion {
 
     pub fn get(&self, address: i64) -> Option<RegisterValue> {
         let res = self.content.get(&address);
-        match res.clone() {
-            Some(_) => res.cloned(),
+        match res {
+            Some(v) => Some(v.clone()),
             None => Some(RegisterValue::new(RegisterKind::Number, None, 0)),
         }
     }
@@ -595,7 +638,8 @@ impl MemorySafeRegion {
     pub fn get_length(&self) -> AbstractExpression {
         match self.length {
             AbstractExpression::Immediate(_) => {
-                return AbstractExpression::Immediate((self.content.len() * 8) as i64)
+                // content stores per-byte entries; length in bytes is content.len()
+                AbstractExpression::Immediate(self.content.len() as i64)
             }
             _ => self.length.clone(),
         }
@@ -614,9 +658,7 @@ impl MemorySafetyError {
         }
     }
 
-    pub fn to_string(&self) -> String {
-        format!("{}", &self.details)
-    }
+    // to_string() removed to avoid shadowing Display::to_string provided by std::fmt::Display
 }
 impl fmt::Display for MemorySafetyError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -626,12 +668,12 @@ impl fmt::Display for MemorySafetyError {
 
 pub fn get_register_name_string(r: String) -> String {
     let a: Vec<&str> = r.split(",").collect();
-    for i in a {
+    if let Some(i) = a.into_iter().next() {
         let name = i.trim_matches('[').to_string();
-        return name;
+        name
+    } else {
+        r
     }
-
-    return r;
 }
 
 pub fn expression_to_ast(
@@ -639,46 +681,77 @@ pub fn expression_to_ast(
     expression: AbstractExpression,
 ) -> Option<ast::Int<'_>> {
     match expression.clone() {
-        AbstractExpression::Immediate(num) => {
-            return Some(ast::Int::from_i64(context, num));
-        }
-        AbstractExpression::Abstract(a) => {
-            return Some(ast::Int::new_const(context, a));
-        }
+        AbstractExpression::Immediate(num) => Some(ast::Int::from_i64(context, num)),
+        AbstractExpression::Abstract(a) => Some(ast::Int::new_const(context, a)),
         AbstractExpression::Register(reg) => {
             if let Some(base) = reg.base.clone() {
                 let base = expression_to_ast(context, base).expect("common7");
                 let offset = ast::Int::from_i64(context, reg.offset);
-                return Some(ast::Int::add(context, &[&base, &offset]));
+                Some(ast::Int::add(context, &[&base, &offset]))
             } else {
-                return Some(ast::Int::from_i64(context, reg.offset));
+                Some(ast::Int::from_i64(context, reg.offset))
             }
         }
         AbstractExpression::Expression(op, old1, old2) => {
             let new1 = expression_to_ast(context, *old1).expect("common8");
             let new2 = expression_to_ast(context, *old2).expect("common8");
             match op.as_str() {
-                "+" => return Some(ast::Int::add(context, &[&new1, &new2])),
-                "-" => return Some(ast::Int::sub(context, &[&new1, &new2])),
-                "*" => return Some(ast::Int::mul(context, &[&new1, &new2])),
-                "/" => return Some(new1.div(&new2)),
+                "+" => Some(ast::Int::add(context, &[&new1, &new2])),
+                "-" => Some(ast::Int::sub(context, &[&new1, &new2])),
+                "*" => Some(ast::Int::mul(context, &[&new1, &new2])),
+                "/" => Some(new1.div(&new2)),
                 "lsl" => {
                     let two = ast::Int::from_i64(context, 2);
                     let multiplier = two.power(&new2).to_int();
-                    return Some(ast::Int::mul(context, &[&new1, &multiplier]));
+                    Some(ast::Int::mul(context, &[&new1, &multiplier]))
                 }
                 ">>" | "lsr" => {
                     let two = ast::Int::from_i64(context, 2);
                     let divisor = new2.div(&two);
-                    return Some(new1.div(&divisor));
+                    Some(new1.div(&divisor))
                 }
-                "%" => return Some(new1.modulo(&new2)),
-                _ => {
-                    todo!("expression to AST {:?} {:?}", op, expression)
-                }
+                "%" => Some(new1.modulo(&new2)),
+                _ => todo!("expression to AST {:?} {:?}", op, expression),
             }
         }
-        _ => return Some(ast::Int::from_i64(context, 0)),
+        _ => Some(ast::Int::from_i64(context, 0)),
+    }
+}
+
+// Try to reduce an AbstractExpression into a concrete i64 when possible.
+// Uses known labels and register immediates via the provided computer.
+pub fn try_resolve_expr(
+    expr: &AbstractExpression,
+    labels: &std::collections::HashMap<String, i64>,
+    comp: &dyn RegisterProvider,
+) -> Option<i64> {
+    match expr {
+        AbstractExpression::Immediate(n) => Some(*n),
+        AbstractExpression::Abstract(name) => {
+            if let Some(v) = labels.get(name) {
+                return Some(*v);
+            }
+            let rv = comp.get_register_value(name);
+            if rv.kind == RegisterKind::Immediate {
+                return Some(rv.offset);
+            }
+            None
+        }
+        AbstractExpression::Expression(op, a, b) => {
+            if let (Some(x), Some(y)) = (
+                try_resolve_expr(a, labels, comp),
+                try_resolve_expr(b, labels, comp),
+            ) {
+                match op.as_str() {
+                    "+" => return Some(x + y),
+                    "-" => return Some(x - y),
+                    "*" => return Some(x * y),
+                    _ => return None,
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -689,30 +762,18 @@ pub fn comparison_to_ast(
     let left = expression_to_ast(context, *expression.left).expect("common10");
     let right = expression_to_ast(context, *expression.right).expect("common11");
     match expression.op.as_str() {
-        "<" => {
-            return Some(left.lt(&right));
-        }
-        ">" => {
-            return Some(left.gt(&right));
-        }
-        ">=" => {
-            return Some(left.ge(&right));
-        }
-        "<=" => {
-            return Some(left.le(&right));
-        }
-        "==" => {
-            return Some(ast::Bool::and(
-                context,
-                &[&left.le(&right), &left.ge(&right)],
-            ));
-        }
-        "!=" => {
-            return Some(ast::Bool::or(
-                context,
-                &[&left.lt(&right), &left.gt(&right)],
-            ));
-        }
+        "<" => Some(left.lt(&right)),
+        ">" => Some(left.gt(&right)),
+        ">=" => Some(left.ge(&right)),
+        "<=" => Some(left.le(&right)),
+        "==" => Some(ast::Bool::and(
+            context,
+            &[&left.le(&right), &left.ge(&right)],
+        )),
+        "!=" => Some(ast::Bool::or(
+            context,
+            &[&left.lt(&right), &left.gt(&right)],
+        )),
         _ => todo!("unsupported op {:?}", expression.op),
     }
 }
